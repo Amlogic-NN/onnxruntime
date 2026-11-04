@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <cerrno>
 #include <sys/stat.h>
@@ -31,6 +32,54 @@ std::string ShapeString(const std::vector<int64_t>& shape) {
   }
   os << "]";
   return os.str();
+}
+
+bool GetDeclaredNodeArgShape(const NodeArg* node_arg, std::vector<int64_t>& shape) {
+  shape.clear();
+  if (node_arg == nullptr || node_arg->Shape() == nullptr) return false;
+
+  const auto& proto = *node_arg->Shape();
+  shape.reserve(static_cast<size_t>(proto.dim_size()));
+  for (const auto& dim : proto.dim()) {
+    if (dim.has_dim_value() && dim.dim_value() >= 0) {
+      shape.push_back(dim.dim_value());
+    } else if (dim.has_dim_param()) {
+      // One symbolic dimension can be resolved from the ADLA element count.
+      shape.push_back(-1);
+    } else {
+      shape.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ResolveDeclaredOutputShape(const std::vector<int64_t>& declared_shape,
+                                uint32_t element_count,
+                                std::vector<int64_t>& resolved_shape) {
+  resolved_shape = declared_shape;
+  size_t known_count = 1;
+  size_t unknown_index = declared_shape.size();
+  for (size_t index = 0; index < declared_shape.size(); ++index) {
+    const int64_t dim = declared_shape[index];
+    if (dim == -1) {
+      if (unknown_index != declared_shape.size()) return false;
+      unknown_index = index;
+      continue;
+    }
+    if (dim < 0) return false;
+    if (dim == 0) return element_count == 0;
+    const size_t size = static_cast<size_t>(dim);
+    if (size > std::numeric_limits<size_t>::max() / known_count) return false;
+    known_count *= size;
+  }
+
+  if (unknown_index == declared_shape.size()) return known_count == element_count;
+  if (known_count == 0 || element_count % known_count != 0) return false;
+  const size_t inferred = element_count / known_count;
+  if (inferred > static_cast<size_t>(std::numeric_limits<int64_t>::max())) return false;
+  resolved_shape[unknown_index] = static_cast<int64_t>(inferred);
+  return true;
 }
 
 std::string AttrString(const amlnn_tensor_attr& attr) {
@@ -316,13 +365,24 @@ common::Status AmlnnExecutionProvider::Compile(const std::vector<FusedNodeAndGra
          << " outputs=" << runtime->Outputs().size() << "\n";
     for (const auto& attr : runtime->Inputs()) LOGI << "ADLA input: " << AttrString(attr) << "\n";
     for (const auto& attr : runtime->Outputs()) LOGI << "ADLA output: " << AttrString(attr) << "\n";
+
+    std::vector<std::vector<int64_t>> declared_output_shapes;
+    std::vector<bool> has_declared_output_shape;
+    for (const NodeArg* output : groups[group_index].fused_node.get().OutputDefs()) {
+      std::vector<int64_t> shape;
+      has_declared_output_shape.push_back(GetDeclaredNodeArgShape(output, shape));
+      declared_output_shapes.push_back(std::move(shape));
+    }
+
     NodeComputeInfo ci;
     ci.create_state_func = [runtime](ComputeContext*, FunctionState* s) {
       *s = runtime.get();
       return 0;
     };
     ci.release_state_func = [](FunctionState) {};
-    ci.compute_func = [runtime](FunctionState, const OrtApi*, OrtKernelContext* c) {
+    ci.compute_func = [runtime, declared_output_shapes = std::move(declared_output_shapes),
+                       has_declared_output_shape = std::move(has_declared_output_shape)]
+                      (FunctionState, const OrtApi*, OrtKernelContext* c) {
       Ort::KernelContext ctx(c);
       if (ctx.GetInputCount() != runtime->Inputs().size()) {
         const std::string error = "AMLNN input count mismatch: ORT=" + std::to_string(ctx.GetInputCount()) +
@@ -396,6 +456,11 @@ common::Status AmlnnExecutionProvider::Compile(const std::vector<FusedNodeAndGra
         const bool transpose = attr.fmt == AMLNN_TENSOR_NHWC && attr.n_dims == 4;
         std::vector<int64_t> ort_shape = adla_shape;
         if (transpose) ort_shape = {adla_shape[0], adla_shape[3], adla_shape[1], adla_shape[2]};
+        if (i < has_declared_output_shape.size() && has_declared_output_shape[i] &&
+            ResolveDeclaredOutputShape(declared_output_shapes[i], attr.n_elems, ort_shape)) {
+          LOGD << "Output " << i << " using declared ONNX shape "
+               << ShapeString(ort_shape) << "\n";
+        }
         auto value = ctx.GetOutput(i, ort_shape.data(), ort_shape.size());
         auto info = value.GetTensorTypeAndShapeInfo();
         LOGD << "ORT output " << i << ": shape=" << ShapeString(ort_shape)

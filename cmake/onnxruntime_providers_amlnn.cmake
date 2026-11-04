@@ -41,9 +41,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(onnxruntime_providers_amlnn PRIVATE -Wno-error=unused-const-variable)
 endif()
 
-# Preserve the existing platform boundary: Android supports ONNX conversion;
-# other runtime builds use AMLNN_MODEL_PATH to load a precompiled ADLA.
-if(ANDROID)
+# Android keeps online conversion enabled by default. Other platforms can opt
+# in explicitly when matching Core and Compiler runtime libraries are present.
+option(AMLNN_ENABLE_CONVERTER "Enable AMLNN ONNX-to-ADLA converter" ${ANDROID})
+if(AMLNN_ENABLE_CONVERTER)
   if(NOT AMLNN_AML_COMPILER_CORE_INCLUDE_DIR)
     set(AMLNN_AML_COMPILER_CORE_INCLUDE_DIR "$ENV{AMLNN_AML_COMPILER_CORE_INCLUDE_DIR}")
   endif()
@@ -61,7 +62,10 @@ if(ANDROID)
     PRIVATE
       "${ONNXRUNTIME_ROOT}/core/providers/amlnn/builder/third_party"
       "${AMLNN_AML_COMPILER_CORE_INCLUDE_DIR}")
-  target_link_libraries(aml_adla_bridge PUBLIC nlohmann_json::nlohmann_json log)
+  target_link_libraries(aml_adla_bridge PUBLIC nlohmann_json::nlohmann_json)
+  if(ANDROID)
+    target_link_libraries(aml_adla_bridge PUBLIC log)
+  endif()
   if(CMAKE_DL_LIBS)
     target_link_libraries(aml_adla_bridge PUBLIC ${CMAKE_DL_LIBS})
   endif()
